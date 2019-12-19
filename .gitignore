@@ -1,15 +1,16 @@
 # ide
 .spyderproject
+.spyproject
 .project
 .pydevproject
 .settings/
 .idea/
 pvmismatch.sublime-project
 pvmismatch.sublime-workspace
+.vscode
 
 # files
 *.pyc
-*.orig
 
 # build
 dist/
@@ -17,17 +18,24 @@ pvmismatch.egg-info/
 build/
 Makefile
 version.py
+__pycache__/
 
 # docs
 !docs/_templates/
 _*/
+.ipynb_checkpoints
 
 # test
 testPV/
 benchmark_*/
 .coverage
 .cache/
-__pycache__/
+.pytest_cache/
+xlsio_one_mod_test/
 
 # virtualenv
 venv/
+venv2/
+venv3/
+pipfile
+pipfile.lock

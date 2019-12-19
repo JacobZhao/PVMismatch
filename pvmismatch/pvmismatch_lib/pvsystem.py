@@ -4,6 +4,9 @@ This module contains the :class:`~pvmismatch.pvmismatch_lib.pvsystem.PVsystem`
 class.
 """
 
+from __future__ import absolute_import
+from past.builtins import basestring
+from future.utils import iteritems
 import numpy as np
 from copy import copy
 from matplotlib import pyplot as plt
@@ -24,21 +27,42 @@ class PVsystem(object):
     :param numberMods: number of modules per string
     :param pvmods: list of modules, a ``PVmodule`` object or None
     """
-    def __init__(self, pvconst=PVconstants(), numberStrs=NUMBERSTRS,
+    def __init__(self, pvconst=None, numberStrs=NUMBERSTRS,
                  pvstrs=None, numberMods=NUMBERMODS, pvmods=None):
-        self.pvconst = pvconst
-        self.numberStrs = numberStrs
-        self.numberMods = numberMods
-        if pvstrs is None:
-            pvstrs = PVstring(numberMods=self.numberMods, pvmods=pvmods,
-                              pvconst=self.pvconst)
-        # use deep copy instead of making each object in a for-loop
-        if isinstance(pvstrs, PVstring):
-            pvstrs = [pvstrs] * self.numberStrs
-        if len(pvstrs) != self.numberStrs:
-            # TODO: use pvmismatch excecptions
-            raise Exception("Number of strings don't match.")
-        self.pvstrs = pvstrs
+        # is pvstrs a list?
+        try:
+            pvstr0 = pvstrs[0]
+        except TypeError:
+            # is pvstrs a PVstring object?
+            try:
+                pvconst = pvstrs.pvconst
+            except AttributeError:
+                # try to use the pvconst arg or create one if none
+                if not pvconst:
+                    pvconst = PVconstants()
+                # create a pvstring
+                pvstrs = PVstring(numberMods=numberMods, pvmods=pvmods,
+                                  pvconst=pvconst)
+            # expand pvstrs to list
+            pvstrs = [pvstrs] * numberStrs
+            numberMods = [numberMods] * numberStrs
+        else:
+            pvconst = pvstr0.pvconst
+            numberStrs = len(pvstrs)
+            numberMods = []
+            for p in pvstrs:
+                if p.pvconst is not pvconst:
+                    raise Exception('pvconst must be the same for all strings')
+                numberMods.append(len(p.pvmods))
+        self.pvconst = pvconst  #: ``PVconstants`` used in ``PVsystem``
+        self.numberStrs = numberStrs  #: number strings in the system
+        self.numberMods = numberMods  #: list of number of modules per string
+        self.pvstrs = pvstrs  #: list of ``PVstring`` in system
+        # calculate pvsystem
+        self.update()
+
+    def update(self):
+        """Update system calculations."""
         self.Isys, self.Vsys, self.Psys = self.calcSystem()
         (self.Imp, self.Vmp, self.Pmp,
          self.Isc, self.Voc, self.FF, self.eff) = self.calcMPP_IscVocFFeff()
@@ -57,22 +81,38 @@ class PVsystem(object):
     def Vstring(self):
         return np.asarray([pvstr.Vstring.flatten() for pvstr in self.pvstrs])
 
+    @property
+    def Voc_str(self):
+        return np.asarray([pvstr.Voc_mod.sum() for pvstr in self.pvstrs])
+
     def calcSystem(self):
         """
         Calculate system I-V curves.
         Returns (Isys, Vsys, Psys) : tuple of numpy.ndarray of float
         """
         Isys, Vsys = self.pvconst.calcParallel(
-            self.Istring, self.Vstring, self.Vstring.max(), self.Vstring.min()
+            self.Istring, self.Vstring, self.Voc_str.max(), self.Vstring.min()
         )
         Psys = Isys * Vsys
         return Isys, Vsys, Psys
 
     def calcMPP_IscVocFFeff(self):
         mpp = np.argmax(self.Psys)
-        Pmp = self.Psys[mpp]
-        Vmp = self.Vsys[mpp]
-        Imp = self.Isys[mpp]
+        P = self.Psys[mpp - 1:mpp + 2]
+        V = self.Vsys[mpp - 1:mpp + 2]
+        I = self.Isys[mpp - 1:mpp + 2]
+        # calculate derivative dP/dV using central difference
+        dP = np.diff(P, axis=0)  # size is (2, 1)
+        dV = np.diff(V, axis=0)  # size is (2, 1)
+        Pv = dP / dV  # size is (2, 1)
+        # dP/dV is central difference at midpoints,
+        Vmid = (V[1:] + V[:-1]) / 2.0  # size is (2, 1)
+        Imid = (I[1:] + I[:-1]) / 2.0  # size is (2, 1)
+        # interpolate to find Vmp
+        Vmp = (-Pv[0] * np.diff(Vmid, axis=0) / np.diff(Pv, axis=0) + Vmid[0]).item()
+        Imp = (-Pv[0] * np.diff(Imid, axis=0) / np.diff(Pv, axis=0) + Imid[0]).item()
+        # calculate max power at Pv = 0
+        Pmp = Imp * Vmp
         # calculate Voc, current must be increasing so flipup()
         Voc = np.interp(np.float64(0), np.flipud(self.Isys),
                         np.flipud(self.Vsys))
@@ -117,13 +157,12 @@ class PVsystem(object):
             for pvstr in self.pvstrs:
                 pvstr.setSuns(Ee)
         else:
-            for pvstr, pvmod_Ee in Ee.iteritems():
+            for pvstr, pvmod_Ee in iteritems(Ee):
                 pvstr = int(pvstr)
                 self.pvstrs[pvstr] = copy(self.pvstrs[pvstr])
                 self.pvstrs[pvstr].setSuns(pvmod_Ee)
-        self.Isys, self.Vsys, self.Psys = self.calcSystem()
-        (self.Imp, self.Vmp, self.Pmp,
-         self.Isc, self.Voc, self.FF, self.eff) = self.calcMPP_IscVocFFeff()
+        # calculate pvsystem
+        self.update()
 
     def setTemps(self, Tc):
         """
@@ -155,36 +194,28 @@ class PVsystem(object):
             for pvstr in self.pvstrs:
                 pvstr.setTemps(Tc)
         else:
-            for pvstr, pvmod_Tc in Tc.iteritems():
+            for pvstr, pvmod_Tc in iteritems(Tc):
                 pvstr = int(pvstr)
                 self.pvstrs[pvstr] = copy(self.pvstrs[pvstr])
                 self.pvstrs[pvstr].setTemps(pvmod_Tc)
-        self.Isys, self.Vsys, self.Psys = self.calcSystem()
-        (self.Imp, self.Vmp, self.Pmp,
-         self.Isc, self.Voc, self.FF, self.eff) = self.calcMPP_IscVocFFeff()
+        # calculate pvsystem
+        self.update()
 
-    def plotSys(self, sysPlot=None):
+    def plotSys(self, sysPlot=None, fmt=''):
         """
         Plot system I-V curves.
-        Arguments sysPlot : matplotlib.figure.Figure
-        Returns sysPlot : matplotlib.figure.Figure
+
+        :param sysPlot: integer, string, or existing figure
+        :returns: new figure
         """
-        # create new figure if sysPlot is None
-        # or make the specified sysPlot current and clear it
-        if not sysPlot:
-            sysPlot = plt.figure()
-        elif isinstance(sysPlot, (int, basestring)):
+        # create new figure if sysPlot or make the specified sysPlot current
+        # and clear it
+        try:
+            sysPlot.clear()
+        except (AttributeError, SyntaxError):
             sysPlot = plt.figure(sysPlot)
-        else:
-            try:
-                sysPlot = plt.figure(sysPlot.number)
-            except TypeError as e:
-                print '%s is not a figure.' % sysPlot
-                print 'Sorry, "plotSys" takes a "int", "str" or "Figure".'
-                raise e
-        sysPlot.clear()
-        plt.subplot(2, 1, 1)
-        plt.plot(self.Vsys, self.Isys)
+        ax = plt.subplot(2, 1, 1)
+        plt.plot(self.Vsys, self.Isys, fmt)
         plt.xlim(0, self.Voc * 1.1)
         plt.ylim(0, self.Isc * 1.1)
         plt.axvline(self.Vmp, color='r', linestyle=':')
@@ -192,8 +223,8 @@ class PVsystem(object):
         plt.title('System I-V Characteristics')
         plt.ylabel('System Current, I [A]')
         plt.grid()
-        plt.subplot(2, 1, 2)
-        plt.plot(self.Vsys, self.Psys / 1000)
+        plt.subplot(2, 1, 2, sharex=ax)
+        plt.plot(self.Vsys, self.Psys / 1000, fmt)
         plt.xlim(0, self.Voc * 1.1)
         plt.ylim(0, self.Pmp * 1.1 / 1000)
         plt.axvline(self.Vmp, color='r', linestyle=':')
@@ -202,4 +233,5 @@ class PVsystem(object):
         plt.xlabel('System Voltage, V [V]')
         plt.ylabel('System Power, P [kW]')
         plt.grid()
+        plt.tight_layout()
         return sysPlot

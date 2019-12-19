@@ -3,16 +3,23 @@
 This module defines the :class:`~pvmismatch.pvmismatch_lib.pvmodule.PVmodule`.
 """
 
+from __future__ import absolute_import
+from past.builtins import xrange, range
+from builtins import zip
+from six import itervalues
 import numpy as np
 from copy import copy
 from matplotlib import pyplot as plt
 # use absolute imports instead of relative, so modules are portable
 from pvmismatch.pvmismatch_lib.pvconstants import PVconstants, get_series_cells
 from pvmismatch.pvmismatch_lib.pvcell import PVcell
+from pvmismatch.pvmismatch_lib.pvexceptions import PVexception
 
 VBYPASS = np.float64(-0.5)  # [V] trigger voltage of bypass diode
 CELLAREA = np.float64(153.33)  # [cm^2] cell area
-
+DEFAULT_BYPASS = 0
+MODULE_BYPASS = 1
+CUSTOM_SUBSTR_BYPASS = 2
 
 def standard_cellpos_pat(nrows, ncols_per_substr):
     """
@@ -118,23 +125,26 @@ Standard Tiled module with partial cross-ties: 82x6 cells
 Substrings have 27, 28 and 27 rows of cells per diode
 """
 
+
 def combine_parallel_circuits(IVprev_cols, pvconst):
     """
     Combine crosstied circuits in a substring
 
     :param IVprev_cols: lists of IV curves of crosstied and series circuits
-    :return:
+    :param pvconst: an instance of :class:`~pvmismatch.pvconstants.PVconstants`
+    :return: current [A] and voltage [V] of the combined parallel circuites
     """
     # combine crosstied circuits
     Irows, Vrows = [], []
     Isc_rows, Imax_rows = [], []
     for IVcols in zip(*IVprev_cols):
-        Iparallel, Vparallel = zip(*IVcols)
+        Iparallel, Vparallel, Voc_parallel = zip(*IVcols)
         Iparallel = np.asarray(Iparallel)
         Vparallel = np.asarray(Vparallel)
+        Voc_parallel = np.mean(Voc_parallel)
         Irow, Vrow = pvconst.calcParallel(
             Iparallel, Vparallel, Vparallel.max(),
-            Vparallel.min()
+            Vparallel.min(), Voc=Voc_parallel
         )
         Irows.append(Irow)
         Vrows.append(Vrow)
@@ -147,6 +157,34 @@ def combine_parallel_circuits(IVprev_cols, pvconst):
         Irows, Vrows, Isc_rows.mean(), Imax_rows.max()
     )
 
+def parse_diode_config(Vbypass, cell_pos):
+    """
+    Parse diode configuration from the Vbypass argument
+    :param Vbypass: Vbypass config
+    :type Vbypass: float|list|tuple
+    :param cell_pos:
+    :type cell_pos:
+    :return: bypass config
+    :rtype: str
+    """
+    try:
+        # check if float or list/tuple
+        num_bypass = len(Vbypass)
+    except TypeError:
+        # float passed - default case - Vbypass across every cell string
+        return DEFAULT_BYPASS
+    else:
+        # if only one value is passed in the list- assume only one
+        # bypass diode  across the PV module
+        if len(Vbypass) == 1:
+            return MODULE_BYPASS
+        # if more than 1 values are passed, apply them across
+        # the cell strings in ascending order
+        elif len(cell_pos) == num_bypass:
+            return CUSTOM_SUBSTR_BYPASS
+        else:
+            raise PVexception("wrong number of bypass diode values passed : %d"%(len(Vbypass)))
+
 class PVmodule(object):
     """
     A Class for PV modules.
@@ -154,31 +192,57 @@ class PVmodule(object):
     :param cell_pos: cell position pattern
     :type cell_pos: dict
     :param pvcells: list of :class:`~pvmismatch.pvmismatch_lib.pvcell.PVcell`
-    :type pvcells: list
+    :type pvcells: list, :class:`~pvmismatch.pvmismatch_lib.pvcell.PVcell`
     :param pvconst: An object with common parameters and constants.
     :type pvconst: :class:`~pvmismatch.pvmismatch_lib.pvconstants.PVconstants`
-    :param Vbypass: bypass diode trigger voltage [V]
+    :param Vbypass: float|list of :float
+        bypass diode trigger voltage [V]
+        default case - one bypass diode per cell string (VBYPASS = -0.5V(V)) \n
+        float - one bypass diode per cell string with Vf = Vbypass (V) \n
+        len(list) == 1 - one bypass diode per module (bypasses entire module ) \n
+        len(list) == len(cell_pos) - bypass diode value across cell string as defined in the list \n
     :param cellArea: cell area [cm^2]
     """
-    def __init__(self, cell_pos=STD96, pvcells=None, pvconst=PVconstants(),
-                 Vbypass=VBYPASS, cellArea=CELLAREA):
+    def __init__(self, cell_pos=STD96, pvcells=None, pvconst=None,
+                 Vbypass=None, cellArea=CELLAREA):
         # TODO: check cell position pattern
         self.cell_pos = cell_pos  #: cell position pattern dictionary
         self.numberCells = sum([len(c) for s in self.cell_pos for c in s])
         """number of cells in the module"""
-        self.pvconst = pvconst  #: configuration constants
-        self.Vbypass = Vbypass  #: [V] trigger voltage of bypass diode
-        self.cellArea = cellArea  #: [cm^2] cell area
-        if pvcells is None:
-            # faster to use copy instead of making each object in a for-loop
-            # use copy instead of deepcopy to keep same pvconst for all objects
-            # PVcell.calcCell() creates new np.ndarray if attributes change
-            pvcells = PVcell(pvconst=self.pvconst)
-        if isinstance(pvcells, PVcell):
+        # is pvcells a list?
+        try:
+            pvc0 = pvcells[0]
+        except TypeError:
+            # is pvcells an object?
+            try:
+                pvconst = pvcells.pvconst
+            except AttributeError:
+                #  try to use the pvconst arg or create one if none
+                if not pvconst:
+                    pvconst = PVconstants()
+                # create pvcell
+                pvcells = PVcell(pvconst=pvconst)
+            # expand pvcells to list
             pvcells = [pvcells] * self.numberCells
+        else:
+            pvconst = pvc0.pvconst
+            for p in pvcells:
+                if p.pvconst is not pvconst:
+                    raise Exception('PVconstant must be the same for all cells')
+        self.pvconst = pvconst  #: configuration constants
+        
+        # set default value of Vbypass if None
+        if Vbypass is None:
+            self.Vbypass = VBYPASS  #: [V] trigger voltage of bypass diode
+        else:
+            # if an object is passed, use that to determine the config of bypass diodes
+            self.Vbypass = Vbypass
+        self.Vbypass_config = parse_diode_config(self.Vbypass, self.cell_pos)
+
+        self.cellArea = cellArea  #: [cm^2] cell area
+        # check cell position pattern matches list of cells
         if len(pvcells) != self.numberCells:
-            # TODO: use pvexception
-            raise Exception(
+            raise ValueError(
                 "Number of cells doesn't match cell position pattern."
             )
         self.pvcells = pvcells  #: list of `PVcell` objects in this `PVmodule`
@@ -244,7 +308,7 @@ class PVmodule(object):
                     else:
                         new_pvcells[cell_id] = old_pvcells[pvcell]
                 self.pvcells = new_pvcells
-                pvcell_set = old_pvcells.itervalues()
+                pvcell_set = itervalues(old_pvcells)
                 for pvc in pvcell_set:
                     pvc.Ee = Ee
             elif np.size(Ee) == self.numberCells:
@@ -289,8 +353,10 @@ class PVmodule(object):
                 raise Exception("Input irradiance value (Ee) for each cell!")
         self.Imod, self.Vmod, self.Pmod, self.Isubstr, self.Vsubstr = self.calcMod()
 
-# TODO setTemps is a nearly identical copy of setSuns. The DRY principle says that we should not be copying code.
-# TODO Replace both setSuns() and setTemps() with a single method for updating cell parameters that works for all params
+    # TODO setTemps is a nearly identical copy of setSuns. The DRY principle
+    # says that we should not be copying code.
+    # TODO Replace both setSuns() and setTemps() with a single method for
+    # updating cell parameters that works for all params
 
     def setTemps(self, Tc, cells=None):
         """
@@ -314,7 +380,7 @@ class PVmodule(object):
                     else:
                         new_pvcells[cell_id] = old_pvcells[pvcell]
                 self.pvcells = new_pvcells
-                pvcell_set = old_pvcells.itervalues()
+                pvcell_set = itervalues(old_pvcells)
                 for pvc in pvcell_set:
                     pvc.Tcell = Tc
             elif np.size(Tc) == self.numberCells:
@@ -368,7 +434,7 @@ class PVmodule(object):
         # iterate over substrings
         # TODO: benchmark speed difference append() vs preallocate space
         Isubstr, Vsubstr, Isc_substr, Imax_substr = [], [], [], []
-        for substr in self.cell_pos:
+        for substr_idx, substr in enumerate(self.cell_pos):
             # check if cells are in series or any crosstied circuits
             if all(r['crosstie'] == False for c in substr for r in c):
                 idxs = [r['idx'] for c in substr for r in c]
@@ -387,7 +453,8 @@ class PVmodule(object):
                     idxs = [c['idx'] for c in row]
                     Irow, Vrow = self.pvconst.calcParallel(
                         self.Icell[idxs], self.Vcell[idxs],
-                        self.Voc[idxs].max(), self.VRBD.min()
+                        self.Voc[idxs].max(), self.VRBD.min(),
+                        Voc=self.Voc[idxs].mean()
                     )
                     Irows.append(Irow)
                     Vrows.append(Vrow)
@@ -430,7 +497,7 @@ class PVmodule(object):
                             )
                         else:
                             Icol, Vcol = self.Icell[idxs], self.Vcell[idxs]
-                        IVcols.append([Icol, Vcol])
+                        IVcols.append([Icol, Vcol, self.Voc[idxs].sum()])
                     # append IVcols and continue
                     IVprev_cols.append(IVcols)
                     if prev_col:
@@ -458,21 +525,49 @@ class PVmodule(object):
                     Iparallel, Vparallel = zip(*IVall_cols)
                     Iparallel = np.asarray(Iparallel)
                     Vparallel = np.asarray(Vparallel)
+                    Voc_parallel = np.asarray([
+                        np.interp(np.float64(0), np.flipud(i_par), np.flipud(v_par))
+                        for i_par, v_par in zip(Iparallel, Vparallel)])
                     Isub, Vsub = self.pvconst.calcParallel(
-                        Iparallel, Vparallel, Vparallel.max(), Vparallel.min()
+                        Iparallel, Vparallel, Vparallel.max(), Vparallel.min(),
+                        Voc=Voc_parallel.mean()
                     )
-            bypassed = Vsub < self.Vbypass
-            Vsub[bypassed] = self.Vbypass
+
+
+            if self.Vbypass_config == DEFAULT_BYPASS:
+                bypassed = Vsub < self.Vbypass
+                Vsub[bypassed] = self.Vbypass
+            elif self.Vbypass_config == CUSTOM_SUBSTR_BYPASS:
+                if self.Vbypass[substr_idx] is None:
+                    # no bypass for this substring
+                    pass
+                else:
+                    # bypass the substring
+                    bypassed = Vsub < self.Vbypass[substr_idx]
+                    Vsub[bypassed] = self.Vbypass[substr_idx]
+            elif self.Vbypass_config == MODULE_BYPASS:
+                # module bypass value will be assigned after the for loop for substrings is over
+                pass
+
             Isubstr.append(Isub)
             Vsubstr.append(Vsub)
             Isc_substr.append(np.interp(np.float64(0), Vsub, Isub))
             Imax_substr.append(Isub.max())
+            
         Isubstr, Vsubstr = np.asarray(Isubstr), np.asarray(Vsubstr)
         Isc_substr = np.asarray(Isc_substr)
         Imax_substr = np.asarray(Imax_substr)
         Imod, Vmod = self.pvconst.calcSeries(
             Isubstr, Vsubstr, Isc_substr.mean(), Imax_substr.max()
         )
+        
+        # if entire module has only one bypass diode
+        if self.Vbypass_config == MODULE_BYPASS:
+            bypassed = Vmod < self.Vbypass[0]
+            Vmod[bypassed] = self.Vbypass[0]
+        else:
+            pass
+
         Pmod = Imod * Vmod
         return Imod, Vmod, Pmod, Isubstr, Vsubstr
 
@@ -512,6 +607,7 @@ class PVmodule(object):
         plt.xlim(0, self.Voc.max())
         plt.ylim(0, (self.Isc.mean() + 1) * self.Voc.max())
         plt.grid()
+        plt.tight_layout()
         return cellPlot
 
     def plotMod(self):
@@ -520,14 +616,14 @@ class PVmodule(object):
         Returns modPlot : matplotlib.pyplot figure
         """
         modPlot = plt.figure()
-        plt.subplot(2, 1, 1)
+        ax = plt.subplot(2, 1, 1)
         plt.plot(self.Vmod, self.Imod)
         plt.title('Module I-V Characteristics')
         plt.ylabel('Module Current, I [A]')
         plt.ylim(ymin=0)
         plt.xlim(self.Vmod.min() - 1, self.Vmod.max() + 1)
         plt.grid()
-        plt.subplot(2, 1, 2)
+        plt.subplot(2, 1, 2, sharex=ax)
         plt.plot(self.Vmod, self.Pmod)
         plt.title('Module P-V Characteristics')
         plt.xlabel('Module Voltage, V [V]')
@@ -535,4 +631,5 @@ class PVmodule(object):
         plt.ylim(ymin=0)
         plt.xlim(self.Vmod.min() - 1, self.Vmod.max() + 1)
         plt.grid()
+        plt.tight_layout()
         return modPlot
